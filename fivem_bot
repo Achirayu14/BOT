@@ -1,0 +1,124 @@
+import discord
+from discord.ext import tasks
+import aiohttp
+from datetime import datetime
+
+# ================= CONFIG =================
+DISCORD_TOKEN = ""
+CHANNEL_ID = 1494458371468951624
+GUILD_ID = 1491778574284492873
+TARGET_ROLE_ID = 1491787814998769755
+FIVEM_SERVER_ID = "v8d8mr"  # แก้ชื่อตัวแปรตรงนี้ให้ตรงกับที่เรียกใช้ข้างล่าง
+UPDATE_INTERVAL_MINUTES = 2 # แนะนำให้ปรับเป็น 2 เพื่อไม่ให้โดน Cfx แบน IP
+# ==========================================
+
+intents = discord.Intents.default()
+intents.members = True  # จำเป็นสำหรับการดึงรายชื่อคนใน Role
+client = discord.Client(intents=intents)
+
+async def fetch_players():
+    url = f"https://servers-frontend.fivem.net/api/servers/single/{FIVEM_SERVER_ID}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('Data', {}).get('players', [])
+                elif resp.status == 429:
+                    print("[Log] Rate Limit: Cfx ให้รอสักครู่...")
+    except Exception as e:
+        print(f"[ERROR] Fetch failed: {e}")
+    return None
+
+@tasks.loop(minutes=UPDATE_INTERVAL_MINUTES)
+async def update_status():
+    channel = client.get_channel(CHANNEL_ID)
+    guild = client.get_guild(GUILD_ID)
+
+    if not channel or not guild:
+        print("[ERROR] หาห้องหรือดิสไม่เจอ")
+        return
+
+    players = await fetch_players()
+    if players is None:
+        return
+
+    # 1. รวบรวมข้อมูลคนในเกม (Discord ID -> ข้อมูลในเกม)
+    in_game_data = {}
+    for p in players:
+        for identifier in p.get("identifiers", []):
+            if identifier.startswith("discord:"):
+                try:
+                    d_id = int(identifier.split(":")[1])
+                    in_game_data[d_id] = {"name": p['name'], "id": p['id']}
+                except:
+                    continue
+
+    # 2. คัดกรองคนที่มี Role
+    role = guild.get_role(TARGET_ROLE_ID)
+    if not role:
+        print(f"[ERROR] หา Role ID {TARGET_ROLE_ID} ไม่เจอ")
+        return
+
+    online_list = []
+    offline_list = []
+
+    for member in role.members:
+        if member.id in in_game_data:
+            p_info = in_game_data[member.id]
+            # แสดงผลแบบ: [ID 79] ชื่อในเกม (ชื่อดิส)
+            online_list.append(f"🟢 [ID {p_info['id']}] {p_info['name']} ({member.display_name})")
+        else:
+            offline_list.append(f"🔴 {member.display_name}")
+
+    # 3. เตรียมข้อมูลสรุปและเวลา
+    shark_emoji = "<:shark1:1478304000997724222>"
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    total_in_role = len(online_list) + len(offline_list)
+
+    # 4. สร้างเนื้อหา Description (รวมทุกอย่างไว้ในที่เดียว)
+    description = f"📌 **บทบาทที่ตรวจสอบ: {role.mention}**\n\n"
+    
+    description += f"♻️ **Online ({len(online_list)})**\n"
+    description += "\n".join(online_list) if online_list else "ไม่มีคนออนไลน์"
+    
+    description += "\n\n" # เว้นวรรคระหว่างโซน
+    
+    description += f"⛔ **offline ({len(offline_list)})**\n"
+    description += "\n".join(offline_list) if offline_list else "เข้าครบทุกคน"
+    
+    description += "\n" + "─" * 25 # ขีดเส้นใต้แบ่งส่วนสรุป
+    description += f"\n📋 **สรุป:** Online {len(online_list)} / ทั้งหมด {total_in_role} คน"
+    description += f"\n🌎 **ผู้เล่นรวมในเซิร์ฟเวอร์:** {len(players)} คน"
+
+    # 5. สร้าง Embed ตามหัวข้อที่คุณต้องการ
+    embed = discord.Embed(
+        title="🚀 play in shark-community ",
+        description=description,
+        color=0x3498db
+    )
+    embed.set_footer(text=f"อัปเดตล่าสุด: {now}")
+
+    # 6. ลบข้อความเก่าและส่งใหม่ (Auto-Purge)
+    try:
+        # ลบข้อความเก่าของบอทเอง เพื่อไม่ให้รก
+        await channel.purge(limit=5, check=lambda m: m.author == client.user)
+        await channel.send(embed=embed)
+        print(f"[OK] อัปเดตข้อมูลแล้วเมื่อ {now}")
+    except Exception as e:
+        print(f"[ERROR] Send failed: {e}")
+
+@update_status.before_loop
+async def before_loop():
+    await client.wait_until_ready()
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+    if not update_status.is_running():
+        update_status.start()
+
+client.run(DISCORD_TOKEN)
